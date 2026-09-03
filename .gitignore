@@ -1,11 +1,19 @@
-# Scraper output (timestamped snapshots and legacy folder name)
+# Scraper output (timestamped snapshots and legacy folder names)
 knowledgebase_*/
 knowledge_base/
 *.log
 
-# Raw HTML cache (--cache-dir)
+# Raw HTML cache, whatever path is passed to --cache-dir
 .cache/
 html_cache/
+*_cache/
+_cache*/
+
+# Local scratch: throwaway scripts and ad-hoc output directories
+_*.py
+_test*/
+tmp/
+scratch/
 
 # Virtual environments
 .venv/

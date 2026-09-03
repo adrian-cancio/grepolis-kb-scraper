@@ -150,6 +150,14 @@ SUPPORT_LINK_TOKENS = (
 # Any label longer than this is prose, not a legend entry.
 MAX_ICON_LABEL_LEN = 40
 
+# Rejects reward-table rows like "30 Laurels" or "2x Wood", where the second
+# cell holds a per-row quantity rather than the icon's name.
+QUANTITY_LABEL_RE = re.compile(r"^\s*[\d.,]+\s*[x×]?\s*\S", re.UNICODE)
+
+# Stands in for an icon whose meaning could not be recovered as text, so the
+# cell is not mistaken for missing data.
+ICON_PLACEHOLDER = "[icon]"
+
 LOG = logging.getLogger("grepolis-kb")
 
 
@@ -278,17 +286,33 @@ def icon_key(src: str) -> str:
     return src.rstrip("/").rsplit("/", 1)[-1].split(".")[0]
 
 
-def learn_icon_labels(node: Tag, legend: dict[str, str]) -> None:
-    """Record `icon -> label` pairs from legend rows shaped `[icon][name][description]`.
+def _is_descriptive(cell: Tag) -> bool:
+    """True when a table cell reads as an explanatory phrase, not a data point.
 
-    The third descriptive column is what separates a real legend row from an
-    ordinary data row such as `[resource icon][6750]`.
+    Legend descriptions vary in length ("Gathered in the lumber camp" is 27
+    characters), so identity rests on being a multi-word phrase of words
+    rather than a number or a single token.
+    """
+    text = cell.get_text(" ", strip=True)
+    if len(text) < 12 or len(text.split()) < 3:
+        return False
+    letters = sum(ch.isalpha() for ch in text)
+    return letters >= len(text) * 0.6
+
+
+def learn_icon_labels(node: Tag, legend: dict[str, str]) -> None:
+    """Record `icon -> label` pairs from legend rows shaped `[icon][name]...[description]`.
+
+    A descriptive column somewhere after the label is what separates a real
+    legend row from an ordinary data row such as `[resource icon][6750]`.
+    The description is not always the third cell: the resources table uses
+    `[icon][Wood][icon][Lumber camp][Gathered in the lumber camp]`.
     """
     for row in node.find_all("tr"):
         cells = row.find_all(["td", "th"])
-        if len(cells) < 3:
+        if len(cells) < 2:
             continue
-        first, second, third = cells[0], cells[1], cells[2]
+        first, second = cells[0], cells[1]
 
         images = first.find_all("img")
         if len(images) != 1 or first.get_text(strip=True):
@@ -300,19 +324,52 @@ def learn_icon_labels(node: Tag, legend: dict[str, str]) -> None:
         # Data rows hold numbers; legend labels are words.
         if not re.search(r"[^\W\d_]", label, flags=re.UNICODE):
             continue
-        # A legend row explains the icon, so the third cell carries prose.
-        if len(third.get_text(" ", strip=True)) < 40:
+        # Reward tables share the legend shape but pair an icon with a
+        # quantity: `[icon][30 Laurels][You receive archers...]`. A quantity
+        # describes one row, not the icon, so it must not become a label.
+        if QUANTITY_LABEL_RE.match(label):
+            continue
+        # Look for explanatory prose in any cell after the label. Descriptions
+        # are short in some tables ("Gathered in the quarry"), so require a
+        # multi-word phrase rather than a length that excludes them.
+        #
+        # A bare `[icon][label]` pair is accepted only when the row is the
+        # whole story, which is how the combat page defines the three attack
+        # types. Requiring the rest of the row to be empty keeps data rows
+        # like `[icon][6750]` out, since those sit in wider tables.
+        if len(cells) == 2:
+            # Require a multi-word label. That admits stat names such as
+            # "Ranged Attack" while rejecting single-word cell values like a
+            # god or unit name, and it stays language-agnostic.
+            if len(label.split()) < 2:
+                continue
+        elif not any(_is_descriptive(cell) for cell in cells[2:]):
             continue
 
         legend.setdefault(icon_key(str(images[0].get("src", ""))), label)
 
 
 def apply_icon_labels(node: Tag, legend: dict[str, str]) -> None:
-    """Replace icon images with their known label so tables stay meaningful."""
+    """Replace icon images with their learned label so tables stay meaningful.
+
+    Only the legend is trusted. Inferring a label from the column header was
+    tried and rejected: colspans make column indexes unreliable, so a stat
+    icon in the Centaur cost table was mislabeled `Wood` instead of `Attack`.
+    A wrong label is worse than a missing one, because it reads as fact.
+
+    Cells that already carry text are left untouched, since adding a label
+    there would duplicate the wording (`Population` + `Total population
+    spent...`).
+    """
     for img in node.find_all("img"):
+        cell = img.find_parent(["td", "th"])
+        if cell is None or cell.get_text(strip=True):
+            continue
         label = legend.get(icon_key(str(img.get("src", ""))))
-        if label:
-            img.replace_with(f"{label}")
+        # An unlabeled icon still becomes a marker: an empty cell reads as
+        # "no data", which is misleading, whereas the marker says the value
+        # was pictorial and could not be recovered as text.
+        img.replace_with(label or ICON_PLACEHOLDER)
 
 
 def _to_markdown(node: Tag, base_url: str) -> str:

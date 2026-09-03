@@ -156,12 +156,52 @@ character than English, so check the summary your own run prints.
    headers, footers, breadcrumbs, feedback widgets and support-channel
    boilerplate. Boilerplate is matched by CSS class and link target rather than
    by translated text, so the same rules hold in all 21 locales.
-4. **Label icons** — stat icons are hash-named images whose meaning only appears
-   in separate legend tables. The scraper learns `icon -> label` pairs while
-   crawling, then re-parses cached HTML in a second pass so unit and god stat
-   tables keep meaningful labels (`Attack`, `Defense (Sharp)`, `Speed`)
-   instead of bare numbers.
+4. **Label icons** — see below.
 5. **Write** — Markdown with frontmatter, plus the unified corpus and metadata index.
+
+### Icon labeling
+
+The knowledge base uses hash-named images instead of text for resources and
+combat stats. Extracted naively, a cost table becomes meaningless:
+
+```
+|  | 6750 |  | 300 | Attack | 1310 |
+```
+
+There is no way to tell whether `6750` is wood, stone or silver. The scraper
+learns `icon -> label` pairs from the legend tables that appear on overview
+pages, then re-parses in a second pass so pages crawled before the legend was
+known benefit too:
+
+```
+| Wood | 6750 | Favour | 300 | Attack | 1310 |
+```
+
+This recovers about half of all icon-only cells (in Spanish: 84 labels
+covering 548 cells, removing 847 empty cells). The rest are sprites the site
+never names in text, such as the per-god icons in the unit table. Those become
+an explicit `[icon]` marker rather than an empty cell, so a model reads "a
+value existed here but was pictorial" instead of "no data".
+
+Labels are only ever taken from the legend. Inferring them from column headers
+was tried and rejected: `colspan` makes column indexes unreliable, and it
+mislabeled an attack stat as `Wood`. A confidently wrong label is worse than a
+missing one.
+
+Run `python audit_icons.py <locale>` to see coverage and which icons remain
+unlabeled.
+
+## Extra tools
+
+Both are diagnostics, not part of the pipeline:
+
+```bash
+# Icon coverage report for a locale
+python audit_icons.py es_ES
+
+# Diff two snapshots by article ID to find per-locale content gaps
+python compare_locales.py knowledgebase_es_ES_* knowledgebase_en_DK_*
+```
 
 ## Notes and limitations
 
@@ -169,7 +209,9 @@ character than English, so check the summary your own run prints.
   [`wiki.es.grepolis.com`](https://wiki.es.grepolis.com) is a separate MediaWiki
   site with deeper strategy content and is out of scope; it would be better
   served through the MediaWiki API than by link crawling.
-- **Text only.** Images are dropped, so diagrams in event articles are not captured.
+- **Text only.** Images are dropped, so screenshots and diagrams in event
+  articles are not captured. Icons inside tables are converted to text labels
+  where the site names them; see [Icon labeling](#icon-labeling).
 - **Related-article links are kept** at the end of each document. They are useful
   graph signal for RAG, but easy to strip if you want prose only.
 - **No conditional fetching.** Every run re-downloads all ~260 pages
