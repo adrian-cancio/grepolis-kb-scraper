@@ -1,0 +1,8 @@
+beautifulsoup4==4.15.0
+lxml==6.1.3
+markdownify==1.2.3
+requests==2.34.2
+
+# Optional: exact token counts in the final summary.
+# Without it the script falls back to a character-based estimate.
+tiktoken==0.14.0

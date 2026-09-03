@@ -1,0 +1,181 @@
+# grepolis-kb-scraper
+
+Scrapes the [Grepolis support knowledge base](https://support.innogames.com/kb/Grepolis/en_DK)
+(InnoGames) into clean Markdown optimized for LLM ingestion and RAG pipelines.
+All **21 languages** the knowledge base offers are supported.
+
+Produces one Markdown file per article with YAML frontmatter, a single
+concatenated corpus for large context windows, and a JSON crawl index.
+
+## Results from a full run
+
+| Metric | `en_DK` | `es_ES` |
+| --- | --- | --- |
+| Pages crawled | 261 (0 errors) | 262 (0 errors) |
+| Output size | ~1.5 MiB | ~1.7 MiB |
+| Content characters | ~638,000 | ~705,000 |
+| Tokens (`o200k_base`) | ~180,000 | ~206,000 |
+
+Coverage is 100% of in-scope URLs. Page counts differ slightly between
+locales because not every article is translated everywhere.
+
+## Supported locales
+
+Note that International English is `en_DK`, not `en_US` or `en_GB`.
+
+| Code | Language | Code | Language | Code | Language |
+| --- | --- | --- | --- | --- | --- |
+| `cs_CZ` | Czech | `hu_HU` | Hungarian | `ru_RU` | Russian |
+| `da_DK` | Danish | `it_IT` | Italian | `sk_SK` | Slovak |
+| `nl_NL` | Dutch | `nb_NO` | Norwegian | `es_ES` | Spanish |
+| `en_DK` | English (INT, default) | `pl_PL` | Polish | `es_AR` | Spanish (Argentina) |
+| `fi_FI` | Finnish | `pt_PT` | Portuguese | `sv_SE` | Swedish |
+| `fr_FR` | French | `pt_BR` | Portuguese (Brazil) | `tr_TR` | Turkish |
+| `de_DE` | German | `ro_RO` | Romanian | | |
+| `el_GR` | Greek | | | | |
+
+Run `python scrape_kb.py --list-locales` to print this list.
+
+## Install
+
+Requires Python 3.10+ (uses PEP 604 `X | None` syntax).
+
+```bash
+python -m venv .venv
+# Windows
+.\.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -r requirements.txt
+```
+
+## Usage
+
+```bash
+# Full crawl in English (default) into a fresh timestamped directory
+python scrape_kb.py
+
+# Pick a language
+python scrape_kb.py --locale es_ES
+python scrape_kb.py --locale de_DE
+
+# List every supported locale
+python scrape_kb.py --list-locales
+
+# Quick smoke test
+python scrape_kb.py --max-pages 5 --delay 0.3
+
+# Be gentler on the server
+python scrape_kb.py --delay 1.5
+
+# Keep the raw HTML for offline re-parsing
+python scrape_kb.py --cache-dir .cache
+```
+
+Scrape several languages in sequence:
+
+```bash
+# bash
+for loc in en_DK es_ES de_DE; do python scrape_kb.py --locale "$loc"; done
+
+# PowerShell
+foreach ($loc in 'en_DK','es_ES','de_DE') { python scrape_kb.py --locale $loc }
+```
+
+### Options
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--locale` | `en_DK` | Knowledge base language |
+| `--list-locales` | – | Print supported locales and exit |
+| `--start-url` | locale root | Override the crawl entry point |
+| `--output` | `knowledgebase_<locale>_<timestamp>` | Override the output directory |
+| `--delay` | `0.7` | Seconds between requests |
+| `--max-pages` | unlimited | Stop after N pages |
+| `--cache-dir` | disabled | Store raw HTML per page |
+| `--verbose` | off | Debug logging |
+
+## Output layout
+
+Each run creates its own directory, named after the locale and start time, so
+snapshots are immutable and a re-run can never leave a deleted article behind
+as a stale file:
+
+```
+knowledgebase_en_DK_2026-09-03_14-01-45/
+├── account/
+│   ├── _index.md
+│   └── how-can-i-change-my-password.md
+├── gameplay/
+├── events/
+├── wiki_completa.md    # everything concatenated, with an index
+└── metadata.json       # url, status code, local path per page
+```
+
+Category folders and filenames follow the locale, and non-Latin scripts are
+romanized so paths stay filesystem-safe
+(`Аккаунт/Как я могу поменять свой пароль?` becomes
+`akkaunt/kak-ya-mogu-pomenyat-svoy-parol.md`). Article text itself is never
+transliterated.
+
+Every article file starts with frontmatter:
+
+```yaml
+---
+title: "How can I change my password?"
+url: "https://support.innogames.com/kb/Grepolis/en_DK/356/How-can-I-change-my-password"
+crawled_at: "2026-09-03T14:01:45+00:00"
+category: "Account"
+---
+```
+
+### Which output should I use?
+
+- **Per-article files** — best for RAG. They average ~700 tokens, a good chunk
+  size that needs no further splitting.
+- **`wiki_completa.md`** — for single-shot context loading. At ~180k tokens
+  (English) it fits comfortably in a 1M window, is tight in 200k, and will not
+  fit in 128k. Roughly 12% of it is the index and per-document headers rather
+  than article prose.
+
+Token counts vary by language. Russian and Greek are considerably denser per
+character than English, so check the summary your own run prints.
+
+## How it works
+
+1. **Fetch** — the site is fully server-rendered, so `requests` is enough; no
+   headless browser needed. Retries with backoff on 429/5xx.
+2. **Crawl** — BFS from the locale root, strictly limited to URLs under
+   `.../kb/Grepolis/<locale>`. Other locales, search, login and support
+   endpoints are excluded, and query strings and fragments are normalized away.
+3. **Extract** — picks the main content container, then strips navigation,
+   headers, footers, breadcrumbs, feedback widgets and support-channel
+   boilerplate. Boilerplate is matched by CSS class and link target rather than
+   by translated text, so the same rules hold in all 21 locales.
+4. **Label icons** — stat icons are hash-named images whose meaning only appears
+   in separate legend tables. The scraper learns `icon -> label` pairs while
+   crawling, then re-parses cached HTML in a second pass so unit and god stat
+   tables keep meaningful labels (`Attack`, `Defense (Sharp)`, `Speed`)
+   instead of bare numbers.
+5. **Write** — Markdown with frontmatter, plus the unified corpus and metadata index.
+
+## Notes and limitations
+
+- **Community wiki not included.** This covers the official support KB only.
+  [`wiki.es.grepolis.com`](https://wiki.es.grepolis.com) is a separate MediaWiki
+  site with deeper strategy content and is out of scope; it would be better
+  served through the MediaWiki API than by link crawling.
+- **Text only.** Images are dropped, so diagrams in event articles are not captured.
+- **Related-article links are kept** at the end of each document. They are useful
+  graph signal for RAG, but easy to strip if you want prose only.
+- **No conditional fetching.** Every run re-downloads all ~260 pages
+  (~3-4 minutes at the default delay); there is no `ETag`/`If-Modified-Since` handling.
+- **Be polite.** The default 0.7s delay is deliberate. Do not lower it much.
+
+Scraped content belongs to InnoGames GmbH and is subject to their terms of use.
+This tool is unofficial and intended for personal and research use.
+
+## License
+
+MIT

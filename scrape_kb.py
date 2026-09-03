@@ -1,0 +1,1006 @@
+"""Grepolis knowledge base scraper.
+
+Crawls the InnoGames Grepolis knowledge base in any of its 21 supported
+locales, extracts the main content of every category and article page, and
+writes LLM/RAG friendly Markdown files with YAML frontmatter.
+
+Every run writes to its own timestamped directory
+(`knowledgebase_<locale>_YYYY-MM-DD_HH-MM-SS`), so snapshots are immutable
+and a re-run can never leave stale files behind.
+
+Outputs, relative to that directory:
+    <category>/<article>.md   per-article Markdown, grouped by category
+    wiki_completa.md          single concatenated corpus
+    metadata.json             crawl index (url, status code, local path)
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import re
+import sys
+import time
+import unicodedata
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator
+from urllib.parse import urljoin, urlparse, urlunparse, unquote
+
+import requests
+from bs4 import BeautifulSoup, Tag
+from markdownify import MarkdownConverter
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+KB_ROOT = "https://support.innogames.com/kb/Grepolis"
+OUTPUT_PREFIX = "knowledgebase"
+TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+# Locales offered by the Grepolis knowledge base language switcher.
+# Note that International English is `en_DK`, not `en_US`/`en_GB`.
+LOCALES: dict[str, str] = {
+    "cs_CZ": "Czech",
+    "da_DK": "Danish",
+    "nl_NL": "Dutch",
+    "en_DK": "English (INT)",
+    "fi_FI": "Finnish",
+    "fr_FR": "French",
+    "de_DE": "German",
+    "el_GR": "Greek",
+    "hu_HU": "Hungarian",
+    "it_IT": "Italian",
+    "nb_NO": "Norwegian",
+    "pl_PL": "Polish",
+    "pt_PT": "Portuguese",
+    "pt_BR": "Portuguese (Brazil)",
+    "ro_RO": "Romanian",
+    "ru_RU": "Russian",
+    "sk_SK": "Slovak",
+    "es_ES": "Spanish",
+    "es_AR": "Spanish (Argentina)",
+    "sv_SE": "Swedish",
+    "tr_TR": "Turkish",
+}
+DEFAULT_LOCALE = "en_DK"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+RETRY_BACKOFF = 2.0
+
+# Content containers, in priority order.
+CONTENT_SELECTORS = (
+    "div.kb-article",
+    "div.faq-section",
+    "div.kb-index",
+    "div.support-content-inner",
+)
+
+# Chrome that must never reach the Markdown output.
+NOISE_SELECTORS = (
+    "script",
+    "style",
+    "noscript",
+    "header",
+    "footer",
+    "nav",
+    "form",
+    "iframe",
+    "svg",
+    ".action-header",
+    ".breadcrumb",
+    ".d-small",
+    ".offcanvas",
+    ".language-select",
+    ".language-select-mobile",
+    ".language-select-offcanvas",
+    ".btn-yellow",
+    ".btn-back",
+    ".btn-forward",
+    ".article-feedback",
+    ".kb-feedback",
+    ".feedback",
+    ".rating",
+    ".bi",
+    ".main-page-addon",
+    ".image-container",
+)
+
+# Query strings / paths that are never worth crawling.
+BLOCKED_PATH_TOKENS = ("/search", "/connect", "/login", "/feedback", "/ticket")
+BLOCKED_QUERY_KEYS = ("query", "ls", "utm_source", "utm_medium", "utm_campaign", "page")
+
+# Per-article boilerplate. These are matched structurally, by CSS class and by
+# link target, so the pipeline stays language-agnostic across all locales.
+BOILERPLATE_SELECTORS = (
+    ".related-articles-header",
+    ".article-feedback",
+    ".kb-feedback",
+    ".feedback",
+    ".rating",
+    # The "Need more help?" support-channel menu is a Bootstrap dropdown.
+    ".dropdown",
+    ".dropdown-toggle",
+    ".dropdown-menu",
+    "button",
+)
+SUPPORT_LINK_TOKENS = (
+    "/connect/",
+    "discord",
+    "forum.grepolis.com",
+    "innogam.es",
+)
+
+# Stat icons are hash-named images; their meaning only appears in legend tables.
+# Any label longer than this is prose, not a legend entry.
+MAX_ICON_LABEL_LEN = 40
+
+LOG = logging.getLogger("grepolis-kb")
+
+
+# --------------------------------------------------------------------------
+# URL handling
+# --------------------------------------------------------------------------
+
+
+def locale_base_url(locale: str) -> str:
+    """Root URL of the knowledge base for *locale*."""
+    return f"{KB_ROOT}/{locale}"
+
+
+def normalize_url(raw: str, base: str) -> str | None:
+    """Resolve *raw* against *base*, strip fragments/queries, drop trailing slash."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw.startswith(("#", "mailto:", "tel:", "javascript:")):
+        return None
+
+    parsed = urlparse(urljoin(base, raw))
+    if parsed.scheme not in ("http", "https"):
+        return None
+
+    path = parsed.path.rstrip("/") or "/"
+    # Tracking params and search queries carry no unique content.
+    cleaned = urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+    return cleaned
+
+
+def in_scope(url: str, scope_prefix: str) -> bool:
+    """True when *url* belongs to the knowledge base under *scope_prefix*."""
+    if not url.startswith(scope_prefix):
+        return False
+    # Guard against sibling locales such as .../es_ES_extra
+    tail = url[len(scope_prefix):]
+    if tail and not tail.startswith("/"):
+        return False
+    lowered = tail.lower()
+    return not any(token in lowered for token in BLOCKED_PATH_TOKENS)
+
+
+def page_kind(url: str, scope_prefix: str) -> str:
+    """Classify a KB url as index, section or article."""
+    tail = url[len(scope_prefix):].strip("/")
+    if not tail:
+        return "index"
+    if tail.startswith("articles/"):
+        return "section"
+    return "article"
+
+
+# --------------------------------------------------------------------------
+# Filesystem helpers
+# --------------------------------------------------------------------------
+
+
+def transliterate(text: str) -> str:
+    """Best-effort romanization of non-Latin scripts.
+
+    NFKD alone maps accented Latin (`Účet` -> `ucet`) but drops Cyrillic and
+    Greek entirely, which would collapse every Russian or Greek title to the
+    same empty slug. Mapping those alphabets keeps filenames distinct.
+    """
+    table = {
+        # Cyrillic
+        "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+        "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+        "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+        "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+        "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+        # Greek
+        "α": "a", "β": "v", "γ": "g", "δ": "d", "ε": "e", "ζ": "z", "η": "i",
+        "θ": "th", "ι": "i", "κ": "k", "λ": "l", "μ": "m", "ν": "n", "ξ": "x",
+        "ο": "o", "π": "p", "ρ": "r", "σ": "s", "ς": "s", "τ": "t", "υ": "y",
+        "φ": "f", "χ": "ch", "ψ": "ps", "ω": "o",
+        # Latin extras that NFKD does not decompose
+        "ß": "ss", "æ": "ae", "ø": "o", "å": "a", "ð": "d", "þ": "th",
+        "ł": "l", "đ": "d", "ı": "i",
+    }
+    return "".join(table.get(ch, ch) for ch in text.lower())
+
+
+def slugify(text: str, max_length: int = 80) -> str:
+    """Return an ASCII, filesystem-safe slug that works in every locale."""
+    text = transliterate(unquote(text))
+    normalized = unicodedata.normalize("NFKD", text)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    ascii_text = re.sub(r"[^\w\s-]", " ", ascii_text)
+    ascii_text = re.sub(r"[\s_-]+", "-", ascii_text).strip("-").lower()
+    if len(ascii_text) > max_length:
+        ascii_text = ascii_text[:max_length].rsplit("-", 1)[0]
+    return ascii_text or "untitled"
+
+
+def yaml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+# --------------------------------------------------------------------------
+# HTML -> Markdown
+# --------------------------------------------------------------------------
+
+
+class KBConverter(MarkdownConverter):
+    """Markdown converter tuned for the InnoGames KB markup.
+
+    Rewrites relative hrefs to absolute URLs so links stay usable once the
+    Markdown is detached from the site.
+    """
+
+    def __init__(self, base_url: str, **options) -> None:
+        super().__init__(**options)
+        self.base_url = base_url
+
+    def convert_a(self, el, text, parent_tags=None):
+        absolute = normalize_url(str(el.get("href", "")), self.base_url)
+        if absolute:
+            el["href"] = absolute
+        return super().convert_a(el, text, parent_tags)
+
+
+def icon_key(src: str) -> str:
+    """Stable identity for an icon image (the CDN hash is the filename)."""
+    return src.rstrip("/").rsplit("/", 1)[-1].split(".")[0]
+
+
+def learn_icon_labels(node: Tag, legend: dict[str, str]) -> None:
+    """Record `icon -> label` pairs from legend rows shaped `[icon][name][description]`.
+
+    The third descriptive column is what separates a real legend row from an
+    ordinary data row such as `[resource icon][6750]`.
+    """
+    for row in node.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 3:
+            continue
+        first, second, third = cells[0], cells[1], cells[2]
+
+        images = first.find_all("img")
+        if len(images) != 1 or first.get_text(strip=True):
+            continue
+
+        label = second.get_text(" ", strip=True)
+        if not label or len(label) > MAX_ICON_LABEL_LEN or second.find("img"):
+            continue
+        # Data rows hold numbers; legend labels are words.
+        if not re.search(r"[^\W\d_]", label, flags=re.UNICODE):
+            continue
+        # A legend row explains the icon, so the third cell carries prose.
+        if len(third.get_text(" ", strip=True)) < 40:
+            continue
+
+        legend.setdefault(icon_key(str(images[0].get("src", ""))), label)
+
+
+def apply_icon_labels(node: Tag, legend: dict[str, str]) -> None:
+    """Replace icon images with their known label so tables stay meaningful."""
+    for img in node.find_all("img"):
+        label = legend.get(icon_key(str(img.get("src", ""))))
+        if label:
+            img.replace_with(f"{label}")
+
+
+def _to_markdown(node: Tag, base_url: str) -> str:
+    converter = KBConverter(
+        base_url,
+        heading_style="ATX",
+        bullets="-",
+        strip=["img"],
+        escape_asterisks=False,
+        escape_underscores=False,
+    )
+    return converter.convert_soup(node)
+
+
+def tidy_markdown(md: str) -> str:
+    """Collapse whitespace noise produced by the source markup."""
+    md = md.replace("\u00a0", " ").replace("\u200b", "")
+    # The source markup often glues text to inline links: "link[*x*](url)here".
+    # `\w` is Unicode-aware, so this holds for Cyrillic, Greek and Turkish too.
+    md = re.sub(r"(?<=[\w.,;:!?)])(\[[^\]]+\]\()", r" \1", md)
+    md = re.sub(r"(\]\([^)\s]+\))(?=[\w¿¡])", r"\1 ", md)
+    md = re.sub(r"[ \t]+\n", "\n", md)
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    lines = [line.rstrip() for line in md.splitlines()]
+    # Drop leftover empty list bullets and stray separators.
+    lines = [ln for ln in lines if ln.strip() not in ("-", "*", "|", "\\")]
+    return "\n".join(lines).strip()
+
+
+# --------------------------------------------------------------------------
+# Page model + parsing
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class Page:
+    url: str
+    status: int
+    kind: str
+    title: str
+    category: str
+    breadcrumbs: list[str] = field(default_factory=list)
+    markdown: str = ""
+    links: list[str] = field(default_factory=list)
+    local_path: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == 200 and self.error is None
+
+
+def _extract_title(soup: BeautifulSoup) -> str:
+    og = soup.find("meta", attrs={"name": "og:title"}) or soup.find(
+        "meta", attrs={"property": "og:title"}
+    )
+    if og and og.get("content"):
+        return str(og["content"]).strip()
+    if soup.title and soup.title.string:
+        return soup.title.string.split(" - ")[0].strip()
+    return "Untitled"
+
+
+def _extract_breadcrumbs(soup: BeautifulSoup) -> list[str]:
+    crumbs: list[str] = []
+    ol = soup.select_one("ol.breadcrumb")
+    if not ol:
+        return crumbs
+    for li in ol.select("li"):
+        label = li.get_text(strip=True)
+        if label and label not in crumbs:
+            crumbs.append(label)
+    return crumbs
+
+
+def _select_content(soup: BeautifulSoup) -> Tag | None:
+    for selector in CONTENT_SELECTORS:
+        node = soup.select_one(selector)
+        if node is not None:
+            return node
+    return None
+
+
+def _strip_noise(node: Tag) -> None:
+    for selector in NOISE_SELECTORS + BOILERPLATE_SELECTORS:
+        for match in node.select(selector):
+            match.decompose()
+
+    # Support-channel links (Discord, forum, ticket form) are identified by
+    # target rather than by label, which keeps this working in every locale.
+    for anchor in list(node.find_all("a", href=True)):
+        href = str(anchor["href"])
+        if any(token in href for token in SUPPORT_LINK_TOKENS):
+            item = anchor.find_parent("li")
+            (item or anchor).decompose()
+
+    # Drop containers left empty by the removals above.
+    for container in list(node.find_all(["ul", "ol"])):
+        if not container.get_text(strip=True):
+            container.decompose()
+
+
+def _collect_links(
+    node: Tag, soup: BeautifulSoup, base: str, scope_prefix: str
+) -> list[str]:
+    """Gather in-scope links from the content area, falling back to the page."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for source in (node, soup):
+        for anchor in source.find_all("a", href=True):
+            url = normalize_url(str(anchor["href"]), base)
+            if url and in_scope(url, scope_prefix) and url not in seen:
+                seen.add(url)
+                found.append(url)
+        if found:
+            break
+    return found
+
+
+def parse_page(
+    url: str,
+    status: int,
+    html: str,
+    scope_prefix: str,
+    legend: dict[str, str] | None = None,
+) -> Page:
+    legend = legend if legend is not None else {}
+    soup = BeautifulSoup(html, "lxml")
+    title = _extract_title(soup)
+    crumbs = _extract_breadcrumbs(soup)
+    # crumbs[0] is the localized "Help" root; the section name follows.
+    category = crumbs[1] if len(crumbs) > 1 else "General"
+
+    content = _select_content(soup)
+    if content is None:
+        return Page(
+            url=url,
+            status=status,
+            kind=page_kind(url, scope_prefix),
+            title=title,
+            category=category,
+            breadcrumbs=crumbs,
+            error="no content container found",
+        )
+
+    links = _collect_links(content, soup, url, scope_prefix)
+    learn_icon_labels(content, legend)
+    _strip_noise(content)
+    apply_icon_labels(content, legend)
+
+    # Remove the duplicated H1/H2 that repeats the frontmatter title.
+    for heading in content.find_all(["h1", "h2"], limit=2):
+        if heading.get_text(strip=True) == title:
+            heading.decompose()
+
+    markdown = tidy_markdown(_to_markdown(content, url))
+    return Page(
+        url=url,
+        status=status,
+        kind=page_kind(url, scope_prefix),
+        title=title,
+        category=category,
+        breadcrumbs=crumbs,
+        markdown=markdown,
+        links=links,
+    )
+
+
+# --------------------------------------------------------------------------
+# Fetching
+# --------------------------------------------------------------------------
+
+
+class Fetcher:
+    def __init__(self, delay: float, locale: str = DEFAULT_LOCALE) -> None:
+        self.delay = delay
+        self.session = requests.Session()
+        # `es_ES` -> `es-ES,es;q=0.9`
+        language = locale.replace("_", "-")
+        primary = language.split("-")[0]
+        self.session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml",
+                "Accept-Language": f"{language},{primary};q=0.9",
+            }
+        )
+
+    def get(self, url: str) -> tuple[int, str]:
+        last_error: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.session.get(url, timeout=REQUEST_TIMEOUT)
+                if response.status_code == 429 or response.status_code >= 500:
+                    wait = RETRY_BACKOFF * attempt
+                    LOG.warning(
+                        "  HTTP %s on %s - retry %d/%d in %.1fs",
+                        response.status_code,
+                        url,
+                        attempt,
+                        MAX_RETRIES,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                response.encoding = response.encoding or "utf-8"
+                return response.status_code, response.text
+            except requests.RequestException as exc:  # network-level failure
+                last_error = exc
+                wait = RETRY_BACKOFF * attempt
+                LOG.warning(
+                    "  %s on %s - retry %d/%d in %.1fs",
+                    type(exc).__name__,
+                    url,
+                    attempt,
+                    MAX_RETRIES,
+                    wait,
+                )
+                time.sleep(wait)
+        raise RuntimeError(f"failed after {MAX_RETRIES} attempts: {last_error}")
+
+    def throttle(self) -> None:
+        time.sleep(self.delay)
+
+
+# --------------------------------------------------------------------------
+# Crawler
+# --------------------------------------------------------------------------
+
+
+def crawl(
+    start_url: str,
+    fetcher: Fetcher,
+    scope_prefix: str,
+    max_pages: int | None = None,
+    cache_dir: Path | None = None,
+) -> tuple[list[Page], dict[str, str], dict[str, str]]:
+    """Breadth-first crawl constrained to URLs under *scope_prefix*.
+
+    Returns the fetched pages, the raw HTML per URL, and the icon legend
+    accumulated across the whole crawl.
+    """
+    queue: deque[str] = deque([start_url])
+    seen: set[str] = {start_url}
+    pages: list[Page] = []
+    raw_html: dict[str, str] = {}
+    legend: dict[str, str] = {}
+    errors = 0
+
+    while queue:
+        if max_pages is not None and len(pages) >= max_pages:
+            LOG.info("Reached max-pages limit (%d); stopping crawl.", max_pages)
+            break
+
+        url = queue.popleft()
+        index = len(pages) + 1
+        LOG.info("[%03d] GET %s", index, url)
+
+        try:
+            status, html = fetcher.get(url)
+        except RuntimeError as exc:
+            errors += 1
+            pages.append(
+                Page(
+                    url=url,
+                    status=0,
+                    kind=page_kind(url, scope_prefix),
+                    title="",
+                    category="",
+                    error=str(exc),
+                )
+            )
+            LOG.error("  FAILED: %s", exc)
+            continue
+        finally:
+            fetcher.throttle()
+
+        if status != 200:
+            errors += 1
+            pages.append(
+                Page(
+                    url=url,
+                    status=status,
+                    kind=page_kind(url, scope_prefix),
+                    title="",
+                    category="",
+                    error=f"HTTP {status}",
+                )
+            )
+            LOG.error("  HTTP %s", status)
+            continue
+
+        raw_html[url] = html
+        if cache_dir is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+            (cache_dir / f"{digest}.html").write_text(html, encoding="utf-8")
+
+        page = parse_page(url, status, html, scope_prefix, legend)
+        pages.append(page)
+
+        new_links = 0
+        for link in page.links:
+            if link not in seen:
+                seen.add(link)
+                queue.append(link)
+                new_links += 1
+
+        if page.error:
+            errors += 1
+            LOG.warning("  parsed with warning: %s", page.error)
+        LOG.info(
+            "  ok | %-7s | %-22s | %5d chars | +%d new | queue=%d",
+            page.kind,
+            page.category[:22],
+            len(page.markdown),
+            new_links,
+            len(queue),
+        )
+
+    LOG.info(
+        "Crawl finished: %d discovered, %d fetched, %d errors.",
+        len(seen),
+        len(pages),
+        errors,
+    )
+    return pages, raw_html, legend
+
+
+def reparse_with_full_legend(
+    pages: list[Page],
+    raw_html: dict[str, str],
+    legend: dict[str, str],
+    scope_prefix: str,
+) -> list[Page]:
+    """Second pass so pages crawled before the legend was known are labelled too."""
+    if not legend:
+        return pages
+
+    refreshed: list[Page] = []
+    changed = 0
+    for page in pages:
+        html = raw_html.get(page.url)
+        if html is None or not page.ok:
+            refreshed.append(page)
+            continue
+        updated = parse_page(page.url, page.status, html, scope_prefix, dict(legend))
+        if updated.markdown != page.markdown:
+            changed += 1
+        refreshed.append(updated)
+
+    LOG.info(
+        "Second pass: %d icon labels, %d pages enriched.",
+        len(legend),
+        changed,
+    )
+    return refreshed
+
+
+# --------------------------------------------------------------------------
+# Writing
+# --------------------------------------------------------------------------
+
+
+def build_frontmatter(page: Page, crawled_at: str) -> str:
+    return "\n".join(
+        [
+            "---",
+            f'title: "{yaml_escape(page.title)}"',
+            f'url: "{yaml_escape(page.url)}"',
+            f'crawled_at: "{crawled_at}"',
+            f'category: "{yaml_escape(page.category)}"',
+            "---",
+            "",
+        ]
+    )
+
+
+def assign_paths(pages: Iterable[Page], output_dir: Path) -> None:
+    """Give every successful page a unique, category-nested local path."""
+    used: set[Path] = set()
+    for page in pages:
+        if not page.ok or not page.markdown:
+            continue
+        if page.kind in ("index", "section"):
+            folder = output_dir / slugify(page.category if page.kind == "section" else "index")
+            stem = "_index" if page.kind == "section" else "index-general"
+        else:
+            folder = output_dir / slugify(page.category)
+            stem = slugify(page.title)
+
+        candidate = folder / f"{stem}.md"
+        counter = 2
+        while candidate in used:
+            candidate = folder / f"{stem}-{counter}.md"
+            counter += 1
+        used.add(candidate)
+        page.local_path = str(candidate.relative_to(output_dir)).replace("\\", "/")
+
+
+def write_articles(pages: Iterable[Page], output_dir: Path, crawled_at: str) -> int:
+    written = 0
+    for page in pages:
+        if not page.local_path:
+            continue
+        target = output_dir / page.local_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        body = f"{build_frontmatter(page, crawled_at)}\n# {page.title}\n\n{page.markdown}\n"
+        target.write_text(body, encoding="utf-8")
+        written += 1
+    return written
+
+
+def sort_key(page: Page) -> tuple[int, str, str]:
+    """Index first, then sections and their articles alphabetically."""
+    kind_rank = {"index": 0, "section": 1, "article": 2}
+    return (kind_rank.get(page.kind, 3), page.category.lower(), page.title.lower())
+
+
+def write_full_wiki(
+    pages: list[Page], output_dir: Path, crawled_at: str, locale: str
+) -> Path:
+    target = output_dir / "wiki_completa.md"
+    usable = sorted([p for p in pages if p.local_path], key=sort_key)
+    base_url = locale_base_url(locale)
+    language = LOCALES.get(locale, locale)
+
+    chunks: list[str] = [
+        "---",
+        f'title: "Complete Grepolis knowledge base ({locale})"',
+        f'language: "{language}"',
+        f'locale: "{locale}"',
+        f'source: "{base_url}"',
+        f'crawled_at: "{crawled_at}"',
+        f"documents: {len(usable)}",
+        "---",
+        "",
+        f"# Grepolis knowledge base ({language})",
+        "",
+        f"Corpus generated from {base_url} on {crawled_at}.",
+        f"Contains {len(usable)} documents ordered by category.",
+        "",
+        "## Index",
+        "",
+    ]
+
+    for page in usable:
+        chunks.append(f"- [{page.category}] {page.title} — {page.url}")
+    chunks.append("")
+
+    current_category = None
+    for page in usable:
+        if page.category != current_category:
+            current_category = page.category
+            chunks.extend(["", "---", "", f"# Category: {current_category}", ""])
+        chunks.extend(
+            [
+                "",
+                "---",
+                "",
+                f"## {page.title}",
+                "",
+                f"- **URL:** {page.url}",
+                f"- **Category:** {page.category}",
+                f"- **Local path:** {page.local_path}",
+                "",
+                page.markdown,
+                "",
+            ]
+        )
+
+    target.write_text("\n".join(chunks).strip() + "\n", encoding="utf-8")
+    return target
+
+
+def write_metadata(
+    pages: list[Page], output_dir: Path, crawled_at: str, locale: str
+) -> Path:
+    target = output_dir / "metadata.json"
+    payload = {
+        "source": locale_base_url(locale),
+        "scope_prefix": locale_base_url(locale),
+        "locale": locale,
+        "language": LOCALES.get(locale, locale),
+        "crawled_at": crawled_at,
+        "total_urls": len(pages),
+        "successful": sum(1 for p in pages if p.local_path),
+        "failed": sum(1 for p in pages if not p.ok),
+        "pages": [
+            {
+                "url": p.url,
+                "status_code": p.status,
+                "kind": p.kind,
+                "title": p.title,
+                "category": p.category,
+                "breadcrumbs": p.breadcrumbs,
+                "local_path": p.local_path,
+                "characters": len(p.markdown),
+                "error": p.error,
+            }
+            for p in sorted(pages, key=sort_key)
+        ],
+    }
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return target
+
+
+# --------------------------------------------------------------------------
+# Reporting
+# --------------------------------------------------------------------------
+
+
+def iter_files(output_dir: Path) -> Iterator[Path]:
+    yield from (p for p in output_dir.rglob("*") if p.is_file())
+
+
+def count_tokens(text: str) -> tuple[int, str]:
+    """Count tokens with tiktoken when available, else fall back to a heuristic.
+
+    The fallback assumes ~3.4 characters per token. That is denser than the
+    ~4.0 rule of thumb for English because most locales here are not English,
+    and it is only an approximation; install tiktoken for exact counts.
+    """
+    try:
+        import tiktoken
+
+        encoding = tiktoken.get_encoding("o200k_base")
+        return len(encoding.encode(text)), "o200k_base"
+    except Exception:
+        return round(len(text) / 3.4), "estimated"
+
+
+def summarize(pages: list[Page], output_dir: Path) -> None:
+    files = list(iter_files(output_dir))
+    total_bytes = sum(f.stat().st_size for f in files)
+    md_files = [f for f in files if f.suffix == ".md"]
+    saved = [p for p in pages if p.local_path]
+    total_chars = sum(len(p.markdown) for p in saved)
+    tokens, token_source = count_tokens("\n".join(p.markdown for p in saved))
+
+    by_category: dict[str, int] = {}
+    for page in saved:
+        by_category[page.category] = by_category.get(page.category, 0) + 1
+
+    print()
+    print("=" * 62)
+    print(" PIPELINE SUMMARY")
+    print("=" * 62)
+    print(f" Output directory ......... {output_dir}")
+    print(f" URLs crawled ............. {len(pages)}")
+    print(f" Pages saved .............. {len(saved)}")
+    print(f" Errors ................... {sum(1 for p in pages if not p.ok)}")
+    print(f" Files on disk ............ {len(files)} ({len(md_files)} .md)")
+    print(f" Total size ............... {total_bytes / 1024:.1f} KiB")
+    print(f" Content characters ....... {total_chars:,}")
+    print(f" Tokens ({token_source:>12}) .... {tokens:,}")
+    print("-" * 62)
+    print(" Documents per category:")
+    for category, count in sorted(by_category.items(), key=lambda kv: -kv[1]):
+        print(f"   {count:3d}  {category}")
+    failures = [p for p in pages if not p.ok]
+    if failures:
+        print("-" * 62)
+        print(" Failures:")
+        for page in failures:
+            print(f"   [{page.status}] {page.url} -> {page.error}")
+    print("=" * 62)
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def build_output_dir(base: Path | None, run_started: datetime, locale: str) -> Path:
+    """Return a unique, timestamped output directory for this run.
+
+    Each run writes to `knowledgebase_<locale>_YYYY-MM-DD_HH-MM-SS`, so previous
+    snapshots are never overwritten and stale files can never linger.
+    """
+    if base is not None:
+        return base
+    stamp = run_started.astimezone().strftime(TIMESTAMP_FORMAT)
+    return Path(f"{OUTPUT_PREFIX}_{locale}_{stamp}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--locale",
+        default=DEFAULT_LOCALE,
+        choices=sorted(LOCALES),
+        metavar="LOCALE",
+        help=(
+            f"Knowledge base locale (default: {DEFAULT_LOCALE}). "
+            "Use --list-locales to see all supported values."
+        ),
+    )
+    parser.add_argument(
+        "--list-locales",
+        action="store_true",
+        help="Print the supported locales and exit.",
+    )
+    parser.add_argument(
+        "--start-url",
+        default=None,
+        help="Override the crawl entry point (defaults to the locale root).",
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Output directory. Defaults to a timestamped "
+            f"'{OUTPUT_PREFIX}_<locale>_{TIMESTAMP_FORMAT}' folder."
+        ),
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.7,
+        help="Seconds to wait between requests (default: 0.7).",
+    )
+    parser.add_argument("--max-pages", type=int, default=None)
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help="Optional directory to store the raw HTML of every fetched page.",
+    )
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args(argv)
+
+
+def print_locales() -> None:
+    print(f"Supported locales ({len(LOCALES)}):\n")
+    for code, name in sorted(LOCALES.items(), key=lambda kv: kv[1]):
+        default = "  (default)" if code == DEFAULT_LOCALE else ""
+        print(f"  {code:<7} {name}{default}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.list_locales:
+        print_locales()
+        return 0
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+
+    locale: str = args.locale
+    scope_prefix = locale_base_url(locale)
+    start_url = args.start_url or scope_prefix
+
+    run_started = datetime.now(timezone.utc)
+    crawled_at = run_started.isoformat(timespec="seconds")
+    output_dir = build_output_dir(args.output, run_started, locale)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    LOG.info("Locale : %s (%s)", locale, LOCALES.get(locale, "unknown"))
+    LOG.info("Source : %s", start_url)
+    LOG.info("Output : %s", output_dir.resolve())
+    LOG.info("Delay  : %.2fs\n", args.delay)
+
+    fetcher = Fetcher(delay=args.delay, locale=locale)
+    pages, raw_html, legend = crawl(
+        start_url,
+        fetcher,
+        scope_prefix,
+        max_pages=args.max_pages,
+        cache_dir=args.cache_dir,
+    )
+    pages = reparse_with_full_legend(pages, raw_html, legend, scope_prefix)
+
+    assign_paths(pages, output_dir)
+    written = write_articles(pages, output_dir, crawled_at)
+    LOG.info("\nWrote %d Markdown files.", written)
+
+    wiki = write_full_wiki(pages, output_dir, crawled_at, locale)
+    LOG.info("Unified corpus: %s", wiki)
+
+    meta = write_metadata(pages, output_dir, crawled_at, locale)
+    LOG.info("Metadata index: %s", meta)
+
+    summarize(pages, output_dir)
+    return 0 if any(p.local_path for p in pages) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

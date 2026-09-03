@@ -1,0 +1,32 @@
+# Scraper output (timestamped snapshots and legacy folder name)
+knowledgebase_*/
+knowledge_base/
+*.log
+
+# Raw HTML cache (--cache-dir)
+.cache/
+html_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
